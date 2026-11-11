@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# YOLO model weights
+*.pt
+*.onnx
+*.engine
+
+# YOLO training outputs
+runs/
+
+# Datasets
+datasets/
+dataset/
+
+# Downloaded test images
+bus.jpg
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment secrets
+.env
+.env.*
