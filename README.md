@@ -6,34 +6,23 @@ YOLO Object Detection과 Segmentation을 활용하여
 사진 속 경사로와 장애물 후보를 분석하고,
 결과를 지도에 표시하는 프로그램입니다.
 
-## 2. Object Detection
+## 2-1. Object Detection
+Roboflow에서 경사로 라벨링 데이터셋 준비
+train.py 작성 및 YOLO11n 모델 학습 (5 Epoch)
+detection.py 작성 및 경사로 탐지 테스트
+.gitignore 설정으로 데이터셋 및 모델 파일 GitHub 업로드 제외
+
+### 모델 평가 결과
+
+Precision: 0.738
+
+Recall: 0.557
+
+mAP@50: 0.648
+
+## 3-1. YOLO Object Detection 개발 환경
 
 
-
-## 2. YOLO Object Detection 개발 환경
-
-### 개발 환경
-- Python 3.11
-- Conda
-- PyTorch 2.6.0 (CUDA 12.6)
-- Ultralytics 8.4.210
-- 테스트 GPU: NVIDIA GeForce RTX 3060
-
-### 설치 방법 (Windows + NVIDIA GPU)
-
-Anaconda 또는 Miniconda가 설치된 PC에서
-프로젝트 루트 디렉터리의 PowerShell을 실행합니다.
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
-```
-
-설치 스크립트는 `yolo-project` Conda 환경을 생성하고
-필요한 라이브러리를 설치합니다.
-
-이 스크립트는 CUDA 12.6 지원 NVIDIA 드라이버를 사용하는
-Windows 환경을 기준으로 작성되었습니다.
-다른 환경에서는 PyTorch 설치 방법을 조정해야 할 수 있습니다.
 
 ### YOLO Detection 테스트
 
