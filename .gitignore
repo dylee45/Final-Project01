@@ -1,29 +1,4 @@
-# Python virtual environment
-.venv/
-venv/
-
 # Python cache
-__pycache__/
-*.pyc
-
-# YOLO datasets
-datasets/
-
-# YOLO training results
-runs/
-
-# YOLO model weights
-*.pt
-
-# Local test results
-results/
-
-# Test images
-test01_pic.jpg
-
-# Editor settings
-.vscode/
-# Python
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
@@ -46,7 +21,11 @@ runs/
 datasets/
 dataset/
 
-# Downloaded test images
+# Local test results
+results/
+
+# Test images
+test01_pic.jpg
 bus.jpg
 
 # IDE and OS
