@@ -1,17 +1,39 @@
-# Python
+# Python cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
 .venv/
 venv/
-__pycache__/
-*.pyc
+env/
+.conda/
 
-# Roboflow datasets
-datasets/
+# YOLO model weights
+*.pt
+*.onnx
+*.engine
 
-# YOLO training results
+# YOLO training outputs
 runs/
 
-# Model weights
-*.pt
+# Datasets
+datasets/
+dataset/
 
-# Local test outputs
+# Local test results
 results/
+
+# Test images
+test01_pic.jpg
+bus.jpg
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment secrets
+.env
+.env.*

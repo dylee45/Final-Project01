@@ -1,0 +1,2 @@
+# YOLO Object Detection
+ultralytics==8.4.210
