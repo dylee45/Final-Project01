@@ -5,3 +5,6 @@
 YOLO Object Detection과 Segmentation을 활용하여
 사진 속 경사로와 장애물 후보를 분석하고,
 결과를 지도에 표시하는 프로그램입니다.
+
+## 2. Object Detection
+
