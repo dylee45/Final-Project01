@@ -1,0 +1,60 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# YOLO datasets
+datasets/
+
+# YOLO training results
+runs/
+
+# YOLO model weights
+*.pt
+
+# Local test results
+results/
+
+# Test images
+test01_pic.jpg
+
+# Editor settings
+.vscode/
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# YOLO model weights
+*.pt
+*.onnx
+*.engine
+
+# YOLO training outputs
+runs/
+
+# Datasets
+datasets/
+dataset/
+
+# Downloaded test images
+bus.jpg
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment secrets
+.env
+.env.*
