@@ -44,3 +44,14 @@ Thumbs.db
 /test/
 /data.yaml
 /README.roboflow.txt
+
+# 테스트용 이미지 (GitHub 업로드 제외)
+/test_images/
+
+# YOLO 학습 데이터 (GitHub 업로드 제외)
+/train/
+/valid/
+/test/
+
+# YOLO 학습 결과 및 모델
+/runs/
