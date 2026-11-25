@@ -3,3 +3,4 @@ streamlit
 folium
 streamlit-folium
 pillow
+-r ramp_angle/requirements.txt

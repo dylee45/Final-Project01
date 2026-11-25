@@ -1,18 +1,18 @@
 import argparse
 import json
+from functools import lru_cache
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from PIL import Image, ImageDraw, ImageOps
-from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 
 MODEL_NAME = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"
 
 
 def select_regions(image):
+    import matplotlib.pyplot as plt
+
     fig, ax = plt.subplots(figsize=(8, 9))
     ax.imshow(image)
     ax.set_axis_off()
@@ -59,10 +59,19 @@ def select_regions(image):
         plt.close(fig)
 
 
-def estimate_depth(image):
-    print("깊이 모델 불러오는 중...", flush=True)
+@lru_cache(maxsize=1)
+def load_depth_model():
+    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
     model = AutoModelForDepthEstimation.from_pretrained(MODEL_NAME).eval()
+    return processor, model
+
+
+def estimate_depth(image):
+    import torch
+
+    processor, model = load_depth_model()
     inputs = processor(images=image, return_tensors="pt")
 
     print("깊이 추정 중...", flush=True)

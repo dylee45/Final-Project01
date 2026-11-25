@@ -8,15 +8,16 @@ from ultralytics import YOLO
 def main():
     # 학습 옵션 설정
     parser = argparse.ArgumentParser(
-        description="YOLO 경사로 Detection 모델 학습"
+        description="YOLO 경사로 탐지·세그멘테이션 모델 학습"
     )
 
     parser.add_argument("--data", type=str, required=True)
-    parser.add_argument("--model", type=str, default="yolo11n.pt")
+    parser.add_argument("--task", choices=("detect", "segment"), default="detect")
+    parser.add_argument("--model", type=str)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--name", type=str, default="ramp_detection")
+    parser.add_argument("--name", type=str)
 
     args = parser.parse_args()
 
@@ -34,7 +35,11 @@ def main():
     print(f"학습 횟수: {args.epochs}")
 
     # YOLO 모델 불러오기
-    model = YOLO(args.model)
+    default_model = "yolo11n-seg.pt" if args.task == "segment" else "yolo11n.pt"
+    model = YOLO(args.model or default_model)
+    task = model.task
+    if args.task == "segment" and task != "segment":
+        parser.error("--task segment에는 세그멘테이션 모델이 필요합니다.")
 
     # 모델 학습
     model.train(
@@ -43,8 +48,8 @@ def main():
         imgsz=args.imgsz,
         batch=args.batch,
         device=device,
-        project=str(Path("runs/detect").resolve()),
-        name=args.name
+        project=str((Path("runs") / task).resolve()),
+        name=args.name or ("ramp_seg" if task == "segment" else "ramp_detection")
     )
 
     print(f"학습 결과 저장 위치: {model.trainer.save_dir}")
