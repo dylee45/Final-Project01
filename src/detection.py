@@ -1,7 +1,6 @@
 from pathlib import Path
 
 from PIL import Image
-from ultralytics import YOLO
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -14,16 +13,30 @@ MODEL_PATH = (
 IMAGE_PATH = ROOT / "test01_pic.jpg"
 
 
+class RampSegmentation:
+    """Set the prediction threshold for the ramp mask model only."""
+
+    def __init__(self, model, confidence):
+        self.model = model
+        self.task = model.task
+        self.confidence = confidence
+
+    def predict(self, *, conf, **kwargs):
+        return self.model.predict(conf=self.confidence, **kwargs)
+
+
 def load_model(model_path=None):
     if model_path is None:
         model_path = MODEL_PATH
 
     model_path = Path(model_path)
 
-    if not model_path.exists():
+    if not model_path.is_file():
         raise FileNotFoundError(
             f"학습된 모델이 없습니다: {model_path}"
         )
+
+    from ultralytics import YOLO
 
     return YOLO(str(model_path))
 
@@ -84,7 +97,8 @@ def detect_ramp_with_image(image, model=None, conf=0.25):
     results = model.predict(
         source=image,
         conf=conf,
-        verbose=False
+        verbose=False,
+        retina_masks=getattr(model, "task", None) == "segment",
     )
 
     detections = []
@@ -93,7 +107,7 @@ def detect_ramp_with_image(image, model=None, conf=0.25):
         if result.boxes is None:
             continue
 
-        for box in result.boxes:
+        for index, box in enumerate(result.boxes):
             class_id = int(box.cls[0])
 
             detections.append({
@@ -104,6 +118,9 @@ def detect_ramp_with_image(image, model=None, conf=0.25):
                     for value in box.xyxy[0].tolist()
                 ]
             })
+            masks = getattr(result, "masks", None)
+            if masks is not None and index < len(masks.data):
+                detections[-1]["mask"] = masks.data[index].cpu().numpy() > 0.5
 
     # YOLO plot()은 BGR 배열을 반환하므로 RGB로 변환
     annotated_image = Image.fromarray(
