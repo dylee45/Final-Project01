@@ -14,6 +14,8 @@ YOLO Object Detection과 Segmentation을 활용하여
 프로그램 개발을 목표로 합니다.
 
 사진을 업로드하면 YOLO 탐지, 경사각 자동 추정, 지도 표시를 한 화면에서 실행할 수 있습니다.
+현재는 경사로 탐지 모델과 GUI 기본 기능을 구현했으며,
+통행 조건 판단 및 기능 통합을 진행할 예정입니다.
 
 ## 2. 개발 환경
 
@@ -36,6 +38,7 @@ YOLO Object Detection과 Segmentation을 활용하여
 - 이미지 업로드 및 미리보기
 - 지도 표시 및 위치 선택
 - YOLO 탐지 결과를 경사각 자동 추정 및 지도에 연동
+- 통행 조건 판단 및 실제 YOLO-GUI 연동은 개발 예정
 
 ## 4. 실행 방법
 
@@ -86,6 +89,9 @@ python detection/predict.py --model runs/detect/ramp_final/weights/best.pt --sou
 1. 경사로·계단·장애물 데이터셋 보강
 2. 모델 성능 개선 및 오탐·미탐 분석
 3. 실측 경사로 사진을 이용해 자동 추정값과 통행 조건을 검증
+3. 통행 조건 판단 로직 구현
+4. YOLO 탐지 결과와 GUI 연동
+5. 지도 시각화 및 통합 테스트
 
 ## 7. GitHub 및 데이터 관리
 
@@ -101,6 +107,7 @@ python detection/predict.py --model runs/detect/ramp_final/weights/best.pt --sou
 - 기본 가로 화각은 60°이며 실제 카메라 화각에 맞춰 조정할 수 있습니다. 팀에서 정한 경사 기준을 입력하면 결과를 비교합니다. 계단·장애물 후보는 현장 확인 항목으로 표시하며, 사진만으로 실제 휠체어 통행 가능 여부를 확정하지 않습니다.
 
 ## 사진 기반 경사각 수동 추정 (비교용)
+## 4. 사진 기반 경사각 추정
 
 ### 구현 내용
 
@@ -111,6 +118,7 @@ python detection/predict.py --model runs/detect/ramp_final/weights/best.pt --sou
 - 가로 화각 45°, 60°, 75° 조건별 결과 출력 및 JSON 저장
 
 기존 수동 스크립트는 자동 추정 결과와 비교할 때 사용할 수 있습니다.
+현재 YOLO 탐지 및 GUI와 연동되지 않은 독립 실행 기능입니다.
 
 ### 사용 모델 및 각도 계산 방식
 
