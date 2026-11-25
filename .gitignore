@@ -1,0 +1,57 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# YOLO model weights
+*.pt
+*.onnx
+*.engine
+
+# YOLO training outputs
+runs/
+
+# Datasets
+datasets/
+dataset/
+
+# Local test results
+results/
+
+# Test images
+test01_pic.jpg
+bus.jpg
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment secrets
+.env
+.env.*
+
+# Roboflow dataset
+/train/
+/valid/
+/test/
+/data.yaml
+/README.roboflow.txt
+
+# 테스트용 이미지 (GitHub 업로드 제외)
+/test_images/
+
+# YOLO 학습 데이터 (GitHub 업로드 제외)
+/train/
+/valid/
+/test/
+
+# YOLO 학습 결과 및 모델
+/runs/
