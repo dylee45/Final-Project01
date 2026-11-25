@@ -1,4 +1,3 @@
-
 # 휠체어 사용자를 위한 경사로 탐지 및 통행 조건 분석
 
 ## 1. 프로젝트 소개
@@ -80,6 +79,7 @@ python detection/predict.py --model runs/detect/ramp_final/weights/best.pt --sou
 
 - [1주차 개발 기록](docs/week01.md)
 - [2주차 개발 기록](docs/week02.md)
+- [3주차 개발 기록](docs/week03.md)
 
 ## 6. 향후 개발 계획
 

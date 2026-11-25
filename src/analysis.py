@@ -1,9 +1,11 @@
 """Connect YOLO detection with automatic depth-based ramp analysis."""
 
-from math import ceil, floor, isclose
+from src.accessibility import check_model_classes, evaluate_accessibility
+from math import ceil, floor
 from pathlib import Path
 
 import numpy as np
+import cv2
 from PIL import Image, ImageDraw, ImageOps
 
 from ramp_angle.automatic import AngleUnavailable, estimate_ramp_angle
@@ -115,16 +117,39 @@ def _boxes_conflict(first, second):
 
 
 def _same_ramp(first, second):
-    first_mask, second_mask = first.get("mask"), second.get("mask")
+    first_mask = first.get("mask")
+    second_mask = second.get("mask")
+
+    # Compare actual masks when both are available.
     if first_mask is not None and second_mask is not None:
         if first_mask is second_mask:
             return True
-        intersection = np.count_nonzero(first_mask & second_mask)
-        union = np.count_nonzero(first_mask | second_mask)
-        return union > 0 and intersection >= 0.75 * union
-    intersection, first_area, second_area = _box_overlap(first["bbox"], second["bbox"])
+
+        intersection = np.count_nonzero(
+            first_mask & second_mask
+        )
+        union = np.count_nonzero(
+            first_mask | second_mask
+        )
+
+        return union > 0 and intersection / union >= 0.75
+
+    # Compare bounding boxes.
+    intersection, first_area, second_area = _box_overlap(
+        first["bbox"],
+        second["bbox"]
+    )
+
     union = first_area + second_area - intersection
-    return union > 0 and intersection >= 0.75 * union
+    smaller_area = min(first_area, second_area)
+
+    if union <= 0 or smaller_area <= 0:
+        return False
+
+    iou = intersection / union
+    containment = intersection / smaller_area
+
+    return iou >= 0.35 or containment >= 0.70
 
 
 def _deduplicate_ramps(ramps, measured_ids=()):
@@ -135,11 +160,45 @@ def _deduplicate_ramps(ramps, measured_ids=()):
         reverse=True,
     )
     kept = []
-    for ramp in ranked:
-        if not any(_same_ramp(ramp, other) for other in kept):
-            kept.append(ramp)
+
+    for i in range(len(ramps)):
+        if i in visited:
+            continue
+
+        group = []
+        stack = [i]
+        visited.add(i)
+
+        # Find connected duplicate candidates.
+        while stack:
+            current = stack.pop()
+            group.append(ramps[current])
+
+            for j in range(len(ramps)):
+                if j in visited:
+                    continue
+
+                if _same_ramp(ramps[current], ramps[j]):
+                    visited.add(j)
+                    stack.append(j)
+
+        # Prefer usable masks, then confidence.
+        best = max(
+            group,
+            key=lambda ramp: (
+                ramp.get("mask") is not None,
+                ramp["confidence"]
+            )
+        )
+
+        kept.append(best)
+
     kept_ids = {id(ramp) for ramp in kept}
-    return [ramp for ramp in ramps if id(ramp) in kept_ids]
+
+    return [
+        ramp for ramp in ramps
+        if id(ramp) in kept_ids
+    ]
 
 
 def _draw_boxes(preview, detections):
@@ -247,6 +306,8 @@ def _ramp_mask_in_box(image, bbox, model):
     a, b, c, d = match["bbox"]
     return full_mask, [a + x0, b + y0, c + x0, d + y0]
 
+def _merge_ramp_masks(objects, image_size):
+    width, height = image_size
 
 # def _segment_ramp(image, bbox, model, full_frame_results):
 #     # match = _matching_ramp(full_frame_results, image.size, bbox)
@@ -295,13 +356,35 @@ def _detect_then_segment(image, detector, ramp_model, ground_model, *, draw_mask
     if any(getattr(model, "task", None) != "segment" for model in (ramp_model, ground_model)):
         raise ValueError("경사로 분할과 기준 바닥에는 각각 Segmentation 모델을 입력해 주세요.")
 
-    detections, preview = detect_ramp_with_image(image, model=detector)
-    obstacles = [obj for obj in detections if _label(obj) in OBSTACLE_LABELS]
-    ramps = [obj for obj in detections if _label(obj) in RAMP_LABELS]
-    full_frame_results = None
     for ramp in ramps:
-        if any(_boxes_conflict(ramp["bbox"], obstacle["bbox"]) for obstacle in obstacles):
-            ramp["mask_error"] = "경사로 후보가 계단 또는 장애물 탐지 영역과 크게 겹칩니다."
+        merged[ramp["mask"]] = 255
+
+    # Scale the kernel according to image width.
+    k = max(3, min(31, round(width * 15 / 580)))
+    if k % 2 == 0:
+        k += 1
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (k, k)
+    )
+
+    closed = cv2.morphologyEx(
+        merged, cv2.MORPH_CLOSE, kernel
+    )
+
+    count, labels = cv2.connectedComponents(closed)
+
+    results = []
+
+    for index in range(1, count):
+        mask = labels == index
+
+        contributors = [
+            ramp for ramp in ramps
+            if np.any(ramp["mask"] & mask)
+        ]
+
+        if not contributors:
             continue
         if full_frame_results is None:
             full_frame_results, _ = detect_ramp_with_image(image, model=ramp_model)
@@ -311,12 +394,9 @@ def _detect_then_segment(image, detector, ramp_model, ground_model, *, draw_mask
         else:
             ramp["mask"], ramp["angle_bbox"] = matched
 
-    filtered_ramps = _deduplicate_ramps(ramps)
-    duplicates_removed = len(filtered_ramps) != len(ramps)
-    if duplicates_removed:
-        kept_ids = {id(ramp) for ramp in filtered_ramps}
-        detections = [
-            obj for obj in detections if _label(obj) not in RAMP_LABELS or id(obj) in kept_ids
+        grounds = [
+            obj for obj in ground_results
+            if _label(obj) in GROUND_LABELS
         ]
         preview = image.copy()
     if any("mask" in ramp for ramp in filtered_ramps):
@@ -327,6 +407,20 @@ def _detect_then_segment(image, detector, ramp_model, ground_model, *, draw_mask
     if duplicates_removed:
         _draw_boxes(preview, [obj for obj in detections if _label(obj) not in GROUND_LABELS])
     return detections, preview
+
+
+def _draw_obstacle_relations(preview, details):
+    """Draw image-space overlap, not physical obstruction."""
+    draw = ImageDraw.Draw(preview)
+    colors = {"크게 겹침": "red", "일부 겹침": "darkorange", "겹치지 않음": "green"}
+    for item in details:
+        x0, y0, x1, y1 = item["bbox"]
+        color = colors[item["relation"]]
+        draw.rectangle((x0, y0, x1, y1), outline=color, width=3)
+        label = f"Overlap {item['overlap']:.1%}"
+        origin = (max(0, x0), max(0, y0 - 32))
+        draw.rectangle(draw.textbbox(origin, label), fill=color)
+        draw.text(origin, label, fill="white")
 
 
 def analyze_image(
@@ -451,30 +545,37 @@ def analyze_image(
             for x, y in pixels.tolist():
                 draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color)
 
-    angles = [item["angle"] for item in measurements if item["angle"] is not None]
-    if obstacle_detected:
-        status, reason = "장애물 확인 필요", "계단 또는 장애물 후보가 탐지됐습니다. 경사로와 같은 통행 경로에 있는지 확인해 주세요."
-    elif not ramps:
-        status = "확인 필요"
-        reason = (
-            "사진 전체와 아래쪽 영역을 모두 검사했지만 경사로가 탐지되지 않았습니다."
-            if retried else "경사로가 탐지되지 않았습니다."
-        )
-    elif len(angles) < len(ramps):
-        status, reason = "확인 필요", "일부 또는 전체 경사로의 각도를 추정할 수 없습니다."
-    elif any(ramp.get("from_crop") for ramp in ramps):
-        status, reason = "확인 필요", "사진 아래쪽을 재검사해 찾은 경사로 후보입니다. 표본 위치와 추정 각도를 확인해 주세요."
-    elif slope_limit is None:
-        status, reason = "확인 필요", "경사각을 추정했습니다. 프로젝트 경사 기준을 입력하면 추정값과 비교할 수 있습니다."
-    elif max(angles) > slope_limit and not isclose(max(angles), slope_limit, abs_tol=1e-8):
-        status, reason = "경사 기준 초과", "입력한 경사 기준을 넘는 경사로 후보가 있습니다."
-    else:
-        status, reason = "경사 기준 이내", "추정한 경사각이 입력한 기준 이내입니다. 통행 조건은 현장에서 확인해 주세요."
+    # 통행 조건 판단 모듈 호출
+    model_classes = check_model_classes(model)
+    if not hybrid and ground_model is not None:
+        ground_classes = check_model_classes(ground_model)
+        model_classes["classes"] = sorted(set(model_classes["classes"]) | set(ground_classes["classes"]))
+        for key in ("stairs_supported", "obstacle_supported"):
+            model_classes[key] = ground_classes[key]
+
+    accessibility_result = evaluate_accessibility(
+        detections=detections,
+        measurements=measurements,
+        slope_limit=slope_limit,
+        retried=retried,
+        model_classes=model_classes,
+    )
+    _draw_obstacle_relations(preview, accessibility_result["obstacle_details"])
 
     return {
-        "status": status,
-        "reason": reason,
-        "detections": [{k: v for k, v in obj.items() if k != "mask"} for obj in detections],
+        "verdict": accessibility_result["verdict"],
+        "verdict_label": accessibility_result["verdict_label"],
+        "status": accessibility_result["status"],
+        "reason": accessibility_result["reason"],
+        "conflicts": accessibility_result["conflicts"],
+        "summary": accessibility_result["summary"],
+        "obstacle_details": accessibility_result["obstacle_details"],
+        "model_classes": accessibility_result["model_classes"],
+        "warnings": accessibility_result["warnings"],
+        "detections": [
+            {k: v for k, v in obj.items() if k != "mask"}
+            for obj in detections
+        ],
         "ramps": measurements,
         "preview": preview,
     }
