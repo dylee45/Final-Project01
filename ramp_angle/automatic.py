@@ -1,5 +1,7 @@
 """Estimate ramp inclination using depth samples inside and below a YOLO box."""
 
+from itertools import chain
+
 import numpy as np
 
 from ramp_angle.estimate import fit_plane, pixel_rays
@@ -200,33 +202,135 @@ def _entrance_edges(image, box):
             break
 
 
+def _ramp_sample_support(mask, cols, offsets, slope, intercept, top, bottom):
+    rows = np.rint(slope * cols + intercept - offsets[:, None]).astype(int)
+    visible = (rows >= top) & (rows < bottom)
+    supported = visible & mask[np.clip(rows, 0, mask.shape[0] - 1), np.rint(cols).astype(int)]
+    return visible, supported
+
+
+def _mask_entrance_edges(surface_masks, box):
+    """Find a local ramp-to-ground transition in the lower part of the ramp box."""
+    ramp, ground = surface_masks
+    left, top, right, bottom = box
+    width, height = right - left, bottom - top
+    band = max(3, round(0.015 * height))
+    cols = np.arange(int(np.ceil(left)), int(np.ceil(right)))
+    rows = np.arange(round(top + 0.50 * height), min(round(bottom), ramp.shape[0] - band - 1))
+    if not len(rows):
+        return
+
+    row_grid = rows[:, None]
+    transitions = ramp[row_grid - 1, cols] & ~ramp[row_grid, cols]
+    transitions &= ramp[row_grid - band, cols] & ~ramp[row_grid + band, cols]
+    transitions &= ground[row_grid + 1, cols] & ground[row_grid + band, cols]
+    visible = transitions.any(axis=0)
+    y = rows[len(rows) - 1 - transitions[::-1, visible].argmax(axis=0)]
+    x = cols[visible]
+    minimum_width = max(20, 0.12 * width)
+    if len(x) < minimum_width:
+        return
+
+    # A short straight section can survive curvature and gaps along the entrance.
+    trial = np.linspace(0, len(x) - 1, min(len(x), 48), dtype=int)
+    a, b = np.triu_indices(len(trial), k=1)
+    a, b = trial[a], trial[b]
+    wide = x[b] - x[a] >= minimum_width
+    a, b = a[wide], b[wide]
+    slopes = (y[b] - y[a]) / (x[b] - x[a])
+    allowed = np.abs(slopes) <= 0.70
+    slopes, a = slopes[allowed], a[allowed]
+    if not len(slopes):
+        return
+    intercepts = y[a] - slopes * x[a]
+    tolerance = max(2, round(height * 0.008))
+    residuals = np.abs(y - (slopes[:, None] * x + intercepts[:, None]))
+    inliers = residuals <= tolerance
+    best = inliers[inliers.sum(axis=1).argmax()]
+    if best.sum() < minimum_width:
+        return
+    points = np.flatnonzero(best)
+    sections = np.split(points, np.flatnonzero(np.diff(x[points]) > 2 * band) + 1)
+    section = max(sections, key=len)
+    if len(section) < minimum_width:
+        return
+    x0, x1 = x[section[0]], x[section[-1]]
+    if len(section) < 0.65 * (x1 - x0 + 1):
+        return
+    slope, intercept = np.polyfit(x[section], y[section], 1)
+    yield slope, intercept, (x0, x1)
+
+
 def _estimate_across_edge(
     image, depth, box, other_boxes, focal, *, surface_masks=None, spread_samples=False,
+    failure_reasons=None,
 ):
+    def reject(reason):
+        if failure_reasons is not None:
+            failure_reasons.append(reason)
+
     left, top, right, bottom = box
     width, height = right - left, bottom - top
     if width < 60 or height < 72:
+        reject("입구 경계를 검사할 영역이 너무 작습니다.")
         return None
-    sample_cols = np.linspace(left + width * 0.27, right - width * 0.25, 32)
-    cols = np.tile(sample_cols, 20)
+    default_cols = np.linspace(left + width * 0.27, right - width * 0.25, 32)
     if spread_samples:
         # Extend farther up the ramp while keeping the reference ground local.
         ramp_offsets = np.linspace(max(5, height * 0.07), height * 0.26, 20)
         ground_offsets = np.linspace(max(5, height * 0.065), height * 0.19, 20)
     else:
         ramp_offsets = ground_offsets = np.linspace(max(5, height * 0.035), height * 0.19, 20)
-    offsets_by_surface = [np.repeat(offsets, len(sample_cols)) for offsets in (ramp_offsets, ground_offsets)]
-    columns = np.rint(cols).astype(int)
     image_height, image_width = depth.shape
-    for slope, intercept in _entrance_edges(image, box):
+    candidates = ((slope, intercept, None) for slope, intercept in _entrance_edges(image, box))
+    if surface_masks is not None:
+        candidates = chain(candidates, _mask_entrance_edges(surface_masks, box))
+    for slope, intercept, boundary_span in candidates:
+        sample_cols = default_cols
+        join_left, join_right = left + width * 0.30, right - width * 0.30
+        if boundary_span is not None:
+            x0, x1 = boundary_span
+            margin = (x1 - x0) * 0.10
+            join_left, join_right = x0 + margin, x1 - margin
+            sample_cols = np.linspace(join_left, join_right, min(32, int(join_right - join_left) + 1))
+        elif surface_masks is not None:
+            visible, supported = _ramp_sample_support(
+                surface_masks[0], sample_cols, ramp_offsets, slope, intercept, top, bottom,
+            )
+            if supported.sum() < 0.45 * visible.sum():
+                scan_cols = np.arange(max(0, int(np.ceil(left))), min(image_width, int(np.ceil(right))))
+                visible, supported = _ramp_sample_support(
+                    surface_masks[0], scan_cols, ramp_offsets, slope, intercept, top, bottom,
+                )
+                covered_cols = scan_cols[(visible.mean(axis=0) >= 0.65)
+                                         & (supported.sum(axis=0) >= 0.45 * visible.sum(axis=0))]
+                # Sample a single continuous part of the entrance; isolated mask pixels cannot define its width.
+                runs = np.split(covered_cols, np.flatnonzero(np.diff(covered_cols) > 1) + 1)
+                span = max(runs, key=len)
+                print(
+    f"[입구 후보] x={scan_cols[0]}..{scan_cols[-1]}, "
+    f"y={slope * scan_cols[0] + intercept:.1f}.."
+    f"{slope * scan_cols[-1] + intercept:.1f}, "
+    f"유효 열={len(covered_cols)}, 최장 연속 폭={len(span)}"
+)
+                if len(span) < 12:
+                    reject("입구 경계 한쪽에서 경사로 마스크가 표본 영역을 충분히 덮지 못했습니다. 연속된 경사면 폭도 부족합니다.")
+                    continue
+                sample_cols = np.linspace(span[0], span[-1], min(len(span), len(default_cols)))
+                join_left, join_right = np.quantile(sample_cols, (0.1, 0.9))
+        cols = np.tile(sample_cols, len(ramp_offsets))
+        columns = np.rint(cols).astype(int)
         seam = slope * cols + intercept
         planes = []
-        for index, (direction, label) in enumerate(((-1, "경사로"), (1, "기준 바닥"))):
-            offsets = offsets_by_surface[index]
+        for index, (direction, label, distances) in enumerate((
+            (-1, "경사로", ramp_offsets), (1, "기준 바닥", ground_offsets),
+        )):
+            offsets = np.repeat(distances, len(sample_cols))
             rows = np.rint(seam + direction * offsets).astype(int)
             limit = image_height if surface_masks is not None and direction > 0 else bottom
             valid = (rows >= top) & (rows < limit) & (rows < image_height)
             if valid.sum() < len(rows) * 0.65:
+                reject(f"{label} 표본 영역이 사진 또는 검사 범위 밖으로 벗어났습니다.")
                 break
             if surface_masks is not None:
                 # Each side must be supported by its corresponding model,
@@ -234,23 +338,27 @@ def _estimate_across_edge(
                 eligible = np.flatnonzero(valid)
                 mask_support = surface_masks[index][rows[eligible], columns[eligible]]
                 if mask_support.mean() < 0.45:
+                    reject(f"입구 경계 한쪽에서 {label} 마스크가 표본 영역을 충분히 덮지 못했습니다.")
                     break
                 valid[eligible] = mask_support
             if spread_samples:
                 # Keep support in both the near and far parts of the visible strip.
                 visible_offsets = offsets[(rows >= top) & (rows < limit)]
                 if not len(visible_offsets):
+                    reject(f"{label} 표본을 뽑을 영역이 사진에 보이지 않습니다.")
                     break
                 near, far = np.quantile(visible_offsets, (1 / 3, 2 / 3))
                 if min(np.count_nonzero(valid & (offsets <= near)),
                        np.count_nonzero(valid & (offsets >= far))) < 12:
+                    reject(f"{label} 표본이 입구에서 가까운 구간과 먼 구간에 충분히 분포하지 않았습니다.")
                     break
             try:
                 planes.append(_fit_samples(
                     depth, columns[valid], rows[valid], offsets[valid],
                     other_boxes, focal, label,
                 ))
-            except AngleUnavailable:
+            except AngleUnavailable as error:
+                reject(str(error))
                 break
         if len(planes) != 2:
             continue
@@ -258,17 +366,133 @@ def _estimate_across_edge(
         angle = _angle_between(ramp_normal, ground_normal)
         # A paint stripe or paver joint on a single plane is not a ramp entrance.
         if not 2.0 <= angle <= 45.0:
+            reject(f"두 평면을 찾았지만 각도 {angle:.2f}°가 경계 검증 범위(2°~45°) 밖입니다.")
             continue
-        join_cols = np.linspace(left + width * 0.30, right - width * 0.30, 7)
+        join_cols = np.linspace(join_left, join_right, 7)
         rays = pixel_rays(join_cols, slope * join_cols + intercept, image_width, image_height, focal)
         projections = rays @ np.stack((ramp_normal, ground_normal), axis=1)
         if np.any(np.abs(projections) < 1e-8):
+            reject("입구 경계에서 두 평면의 깊이를 비교할 수 없습니다.")
             continue
         seam_depths = np.array([ramp_offset, ground_offset]) / projections
         if np.any(seam_depths <= 0):
+            reject("입구 경계에서 두 평면의 유효한 깊이를 얻지 못했습니다.")
             continue
         # The two real surfaces should join near the detected boundary.
         separation = np.abs(seam_depths[:, 0] - seam_depths[:, 1]) / seam_depths.mean(axis=1)
-        if np.quantile(separation, 0.75) <= 0.03:
-            return angle, ramp_points, ground_points
+        depth_gap = np.quantile(separation, 0.75)
+        print(
+            f"[깊이 검사] 입구선=({join_left:.1f}, {slope * join_left + intercept:.1f})"
+            f" → ({join_right:.1f}, {slope * join_right + intercept:.1f}), "
+            f"상대 깊이 차이={depth_gap:.2%}, 허용 기준=3.00%"
+        )
+        if depth_gap <= 0.03:
+            up = ground_normal if ground_offset <= 0 else -ground_normal
+            seam_points = rays[[0, -1]] * seam_depths[[0, -1], 0][:, None]
+
+            ramp_x, ramp_y = ramp_points.astype(int).T
+            sample_rays = pixel_rays(
+                ramp_x, ramp_y, image_width, image_height, focal
+            )
+            samples_3d = sample_rays * depth[ramp_y, ramp_x][:, None]
+            inward_hint = np.median(samples_3d, axis=0) - seam_points.mean(axis=0)
+
+            across = seam_points[1] - seam_points[0]
+            across -= (across @ up) * up
+            across_length = np.linalg.norm(across)
+            if not np.isfinite(across_length) or across_length < 1e-8:
+                reject("입구선의 수평 방향을 구하지 못했습니다.")
+                continue
+
+            forward = np.cross(up, across / across_length)
+            alignment = float(forward @ inward_hint)
+            if not np.isfinite(alignment) or abs(alignment) < 1e-8:
+                reject("경사로 안쪽 방향을 구분하지 못했습니다.")
+                continue
+            if alignment < 0:
+                forward = -forward
+
+            vertical_component = float(ramp_normal @ up)
+            if not np.isfinite(vertical_component) or abs(vertical_component) < 1e-8:
+                reject("진행 방향의 경사를 구하지 못했습니다.")
+                continue
+
+            rise_per_run = -float(ramp_normal @ forward) / vertical_component
+            longitudinal_angle = float(np.degrees(np.arctan(rise_per_run)))
+            print(f"[종단 경사각] {longitudinal_angle:+.2f}° | 평면 사이 각도={angle:.2f}°")
+            return abs(longitudinal_angle), ramp_points, ground_points
+        # if depth_gap <= 0.03:
+        #     return angle, ramp_points, ground_points
+#         if depth_gap <= 0.03:
+#             near_point, far_point = endpoint_rays * endpoint_depths[:, None]
+#             inward_hint = far_point - near_point
+#             up = ground_normal if ground_offset <= 0 else -ground_normal
+
+#             # 입구선 양 끝을 경사면 위 3D 좌표로 복원한다.
+#             seam_points = rays[[0, -1]] * seam_depths[[0, -1], 0][:, None]
+#             across = seam_points[1] - seam_points[0]
+#             across -= (across @ up) * up
+
+#             across_length = np.linalg.norm(across)
+#             if not np.isfinite(across_length) or across_length < 1e-8:
+#                 reject("입구선의 수평 방향을 구하지 못했습니다.")
+#                 continue
+
+#             # 기준 바닥 평면에서 입구선에 직각인 단위 벡터.
+#             forward = np.cross(up, across / across_length)
+#             alignment = float(forward @ inward_hint)
+#             if abs(alignment) < 1e-8:
+#                 reject("경사로 안쪽 방향을 구분하지 못했습니다.")
+#                 continue
+#             if alignment < 0:
+#                 forward = -forward
+
+#             vertical_component = float(ramp_normal @ up)
+#             if abs(vertical_component) < 1e-8:
+#                 reject("진행 방향의 경사를 구하지 못했습니다.")
+#                 continue
+
+#             rise_per_run = -float(ramp_normal @ forward) / vertical_component
+#             longitudinal_angle = float(np.degrees(np.arctan(rise_per_run)))            
+#             # ramp_x, ramp_y = ramp_points.T
+#             # distance_from_edge = slope * ramp_x + intercept - ramp_y
+#             # near_cut, far_cut = np.quantile(distance_from_edge, [0.25, 0.75])
+#             # endpoints = np.array([
+#             #     np.median(ramp_points[distance_from_edge <= near_cut], axis=0),
+#             #     np.median(ramp_points[distance_from_edge >= far_cut], axis=0),
+#             # ])
+
+#             # endpoint_rays = pixel_rays(
+#             #     endpoints[:, 0], endpoints[:, 1], image_width, image_height, focal
+#             # )
+#             # projection = endpoint_rays @ ramp_normal
+#             # if np.any(np.abs(projection) < 1e-8):
+#             #     reject("경사로 진행 방향의 3D 위치를 복원하지 못했습니다.")
+#             #     continue
+
+#             # endpoint_depths = ramp_offset / projection
+#             # if np.any(~np.isfinite(endpoint_depths) | (endpoint_depths <= 0)):
+#             #     reject("경사로 진행 방향의 깊이가 유효하지 않습니다.")
+#             #     continue
+
+#             # near_point, far_point = endpoint_rays * endpoint_depths[:, None]
+#             # displacement = far_point - near_point
+#             # up = ground_normal if ground_offset <= 0 else -ground_normal
+#             # rise = float(displacement @ up)
+#             # run = np.linalg.norm(displacement - rise * up)
+
+#             # if run < 1e-8:
+#             #     reject("경사로 진행 방향의 수평거리가 너무 짧습니다.")
+#             #     continue
+
+#             # longitudinal_angle = float(np.degrees(np.arctan2(rise, run)))
+#             # print(f"[종단 경사각] {longitudinal_angle:+.2f}°")
+#             print(
+#     f"[종단 경사각] {longitudinal_angle:+.2f}° | 평면 사이 각도={angle:.2f}° | "
+#     f"시작점=({endpoints[0, 0]:.1f}, {endpoints[0, 1]:.1f}) → "
+#     f"끝점=({endpoints[1, 0]:.1f}, {endpoints[1, 1]:.1f})"
+# )            
+#             return abs(longitudinal_angle), ramp_points, ground_points      
+ 
+        reject("입구 경계에서 두 평면의 깊이가 맞닿는 조건을 통과하지 못했습니다.")
     return None
