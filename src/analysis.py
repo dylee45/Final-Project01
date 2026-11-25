@@ -4,6 +4,7 @@ from math import ceil, floor, isclose
 from pathlib import Path
 
 import numpy as np
+import cv2
 from PIL import Image, ImageDraw, ImageOps
 
 from ramp_angle.automatic import AngleUnavailable, estimate_ramp_angle
@@ -114,28 +115,83 @@ def _boxes_conflict(first, second):
 
 
 def _same_ramp(first, second):
-    first_mask, second_mask = first.get("mask"), second.get("mask")
+    first_mask = first.get("mask")
+    second_mask = second.get("mask")
+
+    # Compare actual masks when both are available.
     if first_mask is not None and second_mask is not None:
         if first_mask is second_mask:
             return True
-        intersection = np.count_nonzero(first_mask & second_mask)
-        union = np.count_nonzero(first_mask | second_mask)
-        return union > 0 and intersection >= 0.75 * union
-    intersection, first_area, second_area = _box_overlap(first["bbox"], second["bbox"])
+
+        intersection = np.count_nonzero(
+            first_mask & second_mask
+        )
+        union = np.count_nonzero(
+            first_mask | second_mask
+        )
+
+        return union > 0 and intersection / union >= 0.75
+
+    # Compare bounding boxes.
+    intersection, first_area, second_area = _box_overlap(
+        first["bbox"],
+        second["bbox"]
+    )
+
     union = first_area + second_area - intersection
-    return union > 0 and intersection >= 0.75 * union
+    smaller_area = min(first_area, second_area)
+
+    if union <= 0 or smaller_area <= 0:
+        return False
+
+    iou = intersection / union
+    containment = intersection / smaller_area
+
+    return iou >= 0.35 or containment >= 0.70
 
 
 def _deduplicate_ramps(ramps):
-    # Prefer a ramp with a usable mask. Among duplicates with equivalent mask
-    # availability, keep the box with the higher detection confidence.
-    ranked = sorted(ramps, key=lambda ramp: ("mask" in ramp, ramp["confidence"]), reverse=True)
+    visited = set()
     kept = []
-    for ramp in ranked:
-        if not any(_same_ramp(ramp, other) for other in kept):
-            kept.append(ramp)
+
+    for i in range(len(ramps)):
+        if i in visited:
+            continue
+
+        group = []
+        stack = [i]
+        visited.add(i)
+
+        # Find connected duplicate candidates.
+        while stack:
+            current = stack.pop()
+            group.append(ramps[current])
+
+            for j in range(len(ramps)):
+                if j in visited:
+                    continue
+
+                if _same_ramp(ramps[current], ramps[j]):
+                    visited.add(j)
+                    stack.append(j)
+
+        # Prefer usable masks, then confidence.
+        best = max(
+            group,
+            key=lambda ramp: (
+                ramp.get("mask") is not None,
+                ramp["confidence"]
+            )
+        )
+
+        kept.append(best)
+
     kept_ids = {id(ramp) for ramp in kept}
-    return [ramp for ramp in ramps if id(ramp) in kept_ids]
+
+    return [
+        ramp for ramp in ramps
+        if id(ramp) in kept_ids
+    ]
 
 
 def _draw_boxes(preview, detections):
@@ -191,50 +247,182 @@ def _ramp_mask_in_box(image, bbox, model):
     a, b, c, d = match["bbox"]
     return full_mask, [a + x0, b + y0, c + x0, d + y0]
 
+def _merge_ramp_masks(objects, image_size):
+    width, height = image_size
+
+    ramps = [
+        obj for obj in objects
+        if _label(obj) in RAMP_LABELS
+        and obj.get("mask") is not None
+        and obj["mask"].shape == (height, width)
+        and obj["mask"].any()
+    ]
+
+    if not ramps:
+        return []
+
+    merged = np.zeros((height, width), dtype=np.uint8)
+
+    for ramp in ramps:
+        merged[ramp["mask"]] = 255
+
+    # Scale the kernel according to image width.
+    k = max(3, min(31, round(width * 15 / 580)))
+    if k % 2 == 0:
+        k += 1
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (k, k)
+    )
+
+    closed = cv2.morphologyEx(
+        merged, cv2.MORPH_CLOSE, kernel
+    )
+
+    count, labels = cv2.connectedComponents(closed)
+
+    results = []
+
+    for index in range(1, count):
+        mask = labels == index
+
+        contributors = [
+            ramp for ramp in ramps
+            if np.any(ramp["mask"] & mask)
+        ]
+
+        if not contributors:
+            continue
+
+        ys, xs = np.where(mask)
+
+        results.append({
+            "class_name": "ramp",
+            "confidence": max(
+                ramp["confidence"]
+                for ramp in contributors
+            ),
+            "bbox": [
+                int(xs.min()),
+                int(ys.min()),
+                int(xs.max()) + 1,
+                int(ys.max()) + 1
+            ],
+            "mask": mask,
+            "merged_count": len(contributors),
+            "source": "segmentation"
+        })
+
+    return results
 
 def _detect_then_segment(image, detector, ramp_model, ground_model):
     if getattr(detector, "task", None) != "detect":
-        raise ValueError("첫 번째 경로에 경사로·계단 Detection 모델을 입력해 주세요.")
-    if any(getattr(model, "task", None) != "segment" for model in (ramp_model, ground_model)):
-        raise ValueError("경사로 분할과 기준 바닥에는 각각 Segmentation 모델을 입력해 주세요.")
+        raise ValueError("Detection model required.")
 
-    detections, preview = detect_ramp_with_image(image, model=detector)
-    obstacles = [obj for obj in detections if _label(obj) in OBSTACLE_LABELS]
-    ramps = [obj for obj in detections if _label(obj) in RAMP_LABELS]
-    full_frame_results = None
-    for ramp in ramps:
-        if any(_boxes_conflict(ramp["bbox"], obstacle["bbox"]) for obstacle in obstacles):
-            ramp["mask_error"] = "경사로 후보가 계단 또는 장애물 탐지 영역과 크게 겹칩니다."
-            continue
-        if full_frame_results is None:
-            full_frame_results, _ = detect_ramp_with_image(image, model=ramp_model)
-        match = _matching_ramp(full_frame_results, image.size, ramp["bbox"])
+    if any(
+        getattr(model, "task", None) != "segment"
+        for model in (ramp_model, ground_model)
+    ):
+        raise ValueError("Segmentation models required.")
+
+    # 1. Detection
+    detection_results, _ = detect_ramp_with_image(
+        image,
+        model=detector,
+        conf=0.15
+    )
+
+    # 2. Independent segmentation
+    segment_results, _ = detect_ramp_with_image(
+        image,
+        model=ramp_model,
+        conf=0.25
+    )
+
+    obstacles = [
+        obj for obj in detection_results
+        if _label(obj) in OBSTACLE_LABELS
+    ]
+
+    detected_ramps = [
+        obj for obj in detection_results
+        if _label(obj) in RAMP_LABELS
+    ]
+
+    # 3. Merge fragmented ramp masks
+    segmented_ramps = _merge_ramp_masks(
+        segment_results,
+        image.size
+    )
+
+    final_ramps = list(segmented_ramps)
+
+    # 4. Combine detection and segmentation
+    for ramp in detected_ramps:
+        ramp["source"] = "detection"
+
+        match = _matching_ramp(
+            segmented_ramps,
+            image.size,
+            ramp["bbox"]
+        )
+
         if match is not None:
-            ramp["mask"] = match["mask"]
-            ramp["angle_bbox"] = match["bbox"]
+            match["source"] = "detection+segmentation"
             continue
 
-        cropped = _ramp_mask_in_box(image, ramp["bbox"], ramp_model)
-        if cropped is None:
-            ramp["mask_error"] = "원본과 탐지 박스 주변에서 경사면 마스크를 얻지 못했습니다."
-        else:
-            ramp["mask"], ramp["angle_bbox"] = cropped
+        # Retry segmentation around the detection box.
+        cropped = _ramp_mask_in_box(
+            image,
+            ramp["bbox"],
+            ramp_model
+        )
 
-    filtered_ramps = _deduplicate_ramps(ramps)
-    duplicates_removed = len(filtered_ramps) != len(ramps)
-    if duplicates_removed:
-        kept_ids = {id(ramp) for ramp in filtered_ramps}
-        detections = [
-            obj for obj in detections if _label(obj) not in RAMP_LABELS or id(obj) in kept_ids
+        if cropped is not None:
+            ramp["mask"], ramp["angle_bbox"] = cropped
+            ramp["source"] = "detection+crop"
+        else:
+            ramp["mask_error"] = (
+                "경사로 후보의 마스크를 확보하지 못했습니다."
+            )
+
+        final_ramps.append(ramp)
+
+    # 5. Remove duplicate ramps
+    final_ramps = _deduplicate_ramps(final_ramps)
+
+    # 6. Record conflicts without stopping segmentation
+    for ramp in final_ramps:
+        ramp["obstacle_conflict"] = any(
+            _boxes_conflict(
+                ramp["bbox"],
+                obstacle["bbox"]
+            )
+            for obstacle in obstacles
+        )
+
+    # 7. Ground segmentation
+    grounds = []
+
+    if any("mask" in ramp for ramp in final_ramps):
+        ground_results, _ = detect_ramp_with_image(
+            image,
+            model=ground_model
+        )
+
+        grounds = [
+            obj for obj in ground_results
+            if _label(obj) in GROUND_LABELS
         ]
-        preview = image.copy()
-    if any("mask" in ramp for ramp in filtered_ramps):
-        ground_results, _ = detect_ramp_with_image(image, model=ground_model)
-        grounds = [obj for obj in ground_results if _label(obj) in GROUND_LABELS]
-        detections.extend(grounds)
-        _draw_masks(preview, grounds + filtered_ramps)
-    if duplicates_removed:
-        _draw_boxes(preview, [obj for obj in detections if _label(obj) not in GROUND_LABELS])
+
+    # 8. Generate preview
+    detections = obstacles + final_ramps + grounds
+
+    preview = image.copy()
+
+    _draw_masks(preview, grounds + final_ramps)
+    _draw_boxes(preview, obstacles + final_ramps)
+
     return detections, preview
 
 
