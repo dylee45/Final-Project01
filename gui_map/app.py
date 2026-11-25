@@ -1,4 +1,5 @@
 import sys
+from html import escape
 from pathlib import Path
 
 import streamlit as st
@@ -15,6 +16,10 @@ from src.detection import RampSegmentation, load_model
 @st.cache_resource
 def cached_model(path, modified_time):
     return load_model(path)
+
+
+VERDICT_COLORS = {"V": "#16a34a", "X": "#dc2626", "?": "#808080"}
+VERDICT_LABELS = {"V": "통행 가능 후보", "X": "통행 조건 미충족", "?": "판단 보류"}
 
 
 def clear_analysis():
@@ -263,7 +268,18 @@ with left:
         if result is not None:
             st.divider()
             st.markdown("### 분석 결과")
+            verdict = result.get("verdict", "?")
+            if verdict not in VERDICT_COLORS:
+                verdict = "?"
+            st.markdown(
+                f'<div style="font-size:32px;font-weight:700;color:{VERDICT_COLORS[verdict]}">'
+                f'{verdict} · {VERDICT_LABELS[verdict]}</div>',
+                unsafe_allow_html=True,
+            )
             st.write(f"**{result['status']}** · {result['reason']}")
+            st.caption("사진 기반 프로젝트 판단이며 실제 통행 안전을 보장하지 않습니다.")
+            for warning in result.get("warnings", []):
+                st.warning(warning)
             st.image(result["preview"], caption="YOLO 탐지 및 자동 표본", width="stretch")
             if any(ramp["angle"] is not None for ramp in result["ramps"]):
                 st.caption("하늘색 점은 경사로, 주황색 점은 기준 바닥에 사용한 표본입니다.")
@@ -289,18 +305,31 @@ with right:
                 location=location, tooltip="선택한 촬영 위치",
                 icon=folium.Icon(color="blue", icon="info-sign"),
             ).add_to(m)
-        colors = {
-            "경사 기준 이내": "green",
-            "경사 기준 초과": "orange",
-            "장애물 확인 필요": "red",
-            "확인 필요": "gray",
-        }
+        st.caption("🟢 V: 통행 가능 후보 · 🔴 X: 기준 미충족 · ⚪ ?: 판단 보류")
         for coords, saved in st.session_state.map_results.items():
+            verdict = saved.get("verdict", "?")
+            if verdict not in VERDICT_COLORS:
+                verdict = "?"
+            color = VERDICT_COLORS[verdict]
+            marker_html = (
+                f'<div style="width:36px;height:36px;border-radius:50%;'
+                f'background:{color};color:white;border:2px solid white;'
+                'box-shadow:0 1px 5px #555;display:flex;align-items:center;'
+                'justify-content:center;font-size:24px;font-weight:bold;">'
+                f'{verdict}</div>'
+            )
+            popup_lines = [
+                f"{verdict} · {VERDICT_LABELS[verdict]}",
+                saved["status"],
+                saved.get("reason", "판단 사유 미저장"),
+                *saved["angles"],
+                "실제 통행 조건은 현장에서 확인해 주세요.",
+            ]
             folium.Marker(
                 location=coords,
-                tooltip=saved["status"],
-                popup=" · ".join([saved["status"], *saved["angles"]]),
-                icon=folium.Icon(color=colors[saved["status"]], icon="info-sign"),
+                tooltip=f"{verdict} · {VERDICT_LABELS[verdict]}",
+                popup=folium.Popup("<br>".join(escape(line) for line in popup_lines), max_width=320),
+                icon=folium.DivIcon(html=marker_html, icon_size=(36, 36), icon_anchor=(18, 18)),
             ).add_to(m)
 
         map_data = st_folium(
@@ -336,6 +365,8 @@ with right:
         st.caption(f"선택한 위치 · {location[0]:.6f}, {location[1]:.6f}")
         if st.button("지도에 분석 결과 표시", disabled=result is None, width="stretch"):
             st.session_state.map_results[location] = {
+                "verdict": result.get("verdict", "?"),
+                "reason": result["reason"],
                 "status": result["status"],
                 "angles": [
                     f"경사로 {index} {ramp['angle']:.2f}°" if ramp["angle"] is not None
