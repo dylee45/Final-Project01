@@ -1,6 +1,7 @@
 """Connect YOLO detection with automatic depth-based ramp analysis."""
 
-from math import ceil, floor, isclose
+from src.accessibility import check_model_classes, evaluate_accessibility
+from math import ceil, floor
 from pathlib import Path
 
 import numpy as np
@@ -426,6 +427,20 @@ def _detect_then_segment(image, detector, ramp_model, ground_model):
     return detections, preview
 
 
+def _draw_obstacle_relations(preview, details):
+    """Draw image-space overlap, not physical obstruction."""
+    draw = ImageDraw.Draw(preview)
+    colors = {"크게 겹침": "red", "일부 겹침": "darkorange", "겹치지 않음": "green"}
+    for item in details:
+        x0, y0, x1, y1 = item["bbox"]
+        color = colors[item["relation"]]
+        draw.rectangle((x0, y0, x1, y1), outline=color, width=3)
+        label = f"Overlap {item['overlap']:.1%}"
+        origin = (max(0, x0), max(0, y0 - 32))
+        draw.rectangle(draw.textbbox(origin, label), fill=color)
+        draw.text(origin, label, fill="white")
+
+
 def analyze_image(
     image, model, fov=60.0, slope_limit=None, *, ground_model=None, ramp_segment_model=None,
     spread_samples=False,
@@ -441,7 +456,6 @@ def analyze_image(
     else:
         detections, preview, retried = _dual_segmentation(image, model, ground_model)
     ramps = [obj for obj in detections if _label(obj) in RAMP_LABELS]
-    obstacle_detected = any(_label(obj) in OBSTACLE_LABELS for obj in detections)
     measurements = []
     segmented = hybrid or getattr(model, "task", None) == "segment"
     ground_masks = [
@@ -484,30 +498,37 @@ def analyze_image(
                 for x, y in pixels.tolist():
                     draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color)
 
-    angles = [item["angle"] for item in measurements if item["angle"] is not None]
-    if obstacle_detected:
-        status, reason = "장애물 확인 필요", "계단 또는 장애물 후보가 탐지됐습니다. 경사로와 같은 통행 경로에 있는지 확인해 주세요."
-    elif not ramps:
-        status = "확인 필요"
-        reason = (
-            "사진 전체와 아래쪽 영역을 모두 검사했지만 경사로가 탐지되지 않았습니다."
-            if retried else "경사로가 탐지되지 않았습니다."
-        )
-    elif len(angles) < len(ramps):
-        status, reason = "확인 필요", "일부 또는 전체 경사로의 각도를 추정할 수 없습니다."
-    elif any(ramp.get("from_crop") for ramp in ramps):
-        status, reason = "확인 필요", "사진 아래쪽을 재검사해 찾은 경사로 후보입니다. 표본 위치와 추정 각도를 확인해 주세요."
-    elif slope_limit is None:
-        status, reason = "확인 필요", "경사각을 추정했습니다. 프로젝트 경사 기준을 입력하면 추정값과 비교할 수 있습니다."
-    elif max(angles) > slope_limit and not isclose(max(angles), slope_limit, abs_tol=1e-8):
-        status, reason = "경사 기준 초과", "입력한 경사 기준을 넘는 경사로 후보가 있습니다."
-    else:
-        status, reason = "경사 기준 이내", "추정한 경사각이 입력한 기준 이내입니다. 통행 조건은 현장에서 확인해 주세요."
+    # 통행 조건 판단 모듈 호출
+    model_classes = check_model_classes(model)
+    if not hybrid and ground_model is not None:
+        ground_classes = check_model_classes(ground_model)
+        model_classes["classes"] = sorted(set(model_classes["classes"]) | set(ground_classes["classes"]))
+        for key in ("stairs_supported", "obstacle_supported"):
+            model_classes[key] = ground_classes[key]
+
+    accessibility_result = evaluate_accessibility(
+        detections=detections,
+        measurements=measurements,
+        slope_limit=slope_limit,
+        retried=retried,
+        model_classes=model_classes,
+    )
+    _draw_obstacle_relations(preview, accessibility_result["obstacle_details"])
 
     return {
-        "status": status,
-        "reason": reason,
-        "detections": [{k: v for k, v in obj.items() if k != "mask"} for obj in detections],
+        "verdict": accessibility_result["verdict"],
+        "verdict_label": accessibility_result["verdict_label"],
+        "status": accessibility_result["status"],
+        "reason": accessibility_result["reason"],
+        "conflicts": accessibility_result["conflicts"],
+        "summary": accessibility_result["summary"],
+        "obstacle_details": accessibility_result["obstacle_details"],
+        "model_classes": accessibility_result["model_classes"],
+        "warnings": accessibility_result["warnings"],
+        "detections": [
+            {k: v for k, v in obj.items() if k != "mask"}
+            for obj in detections
+        ],
         "ramps": measurements,
         "preview": preview,
     }
