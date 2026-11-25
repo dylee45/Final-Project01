@@ -12,6 +12,7 @@ from ramp_angle.automatic import AngleUnavailable, estimate_ramp_angle
 from ramp_angle.estimate import estimate_depth
 from ramp_angle.segmented import estimate_segmented_angle
 from src.detection import ROOT, detect_ramp_with_image
+from src.detection import ROOT, RampSegmentation, detect_ramp_with_image
 
 RAMP_LABELS = {"ramp", "wheelchair ramp", "경사로"}
 GROUND_LABELS = {"level ground", "ground", "기준 바닥", "기준면"}
@@ -151,8 +152,13 @@ def _same_ramp(first, second):
     return iou >= 0.35 or containment >= 0.70
 
 
-def _deduplicate_ramps(ramps):
-    visited = set()
+def _deduplicate_ramps(ramps, measured_ids=()):
+    # Prefer a ramp with a usable mask. Among duplicates with equivalent mask
+    # availability, keep the box with the higher detection confidence.
+    ranked = sorted(
+        ramps, key=lambda ramp: (id(ramp) in measured_ids, "mask" in ramp, ramp["confidence"]),
+        reverse=True,
+    )
     kept = []
 
     for i in range(len(ramps)):
@@ -207,23 +213,68 @@ def _draw_boxes(preview, detections):
         draw.text(origin, label, fill="white")
 
 
-def _matching_ramp(objects, image_size, bbox):
+# def _matching_ramp(objects, image_size, bbox):
+#     width, height = image_size
+#     left, top = max(0, floor(bbox[0])), max(0, floor(bbox[1]))
+#     right, bottom = min(width, ceil(bbox[2])), min(height, ceil(bbox[3]))
+#     if right <= left or bottom <= top:
+#         return None
+
+#     best, best_overlap = None, 0
+#     for obj in objects:
+#         mask = obj.get("mask")
+#         if _label(obj) not in RAMP_LABELS:
+#             continue
+#         if mask is None or mask.shape != (height, width):
+#             continue
+#         overlap = np.count_nonzero(mask[top:bottom, left:right])
+#         if overlap >= max(60, 0.5 * np.count_nonzero(mask)) and overlap > best_overlap:
+#             best, best_overlap = obj, overlap
+#     return best
+
+def _matching_ramp(objects, image_size, bbox, *, stage):
     width, height = image_size
     left, top = max(0, floor(bbox[0])), max(0, floor(bbox[1]))
     right, bottom = min(width, ceil(bbox[2])), min(height, ceil(bbox[3]))
+    prefix = f"[경사면 매칭 · {stage}]"
+
     if right <= left or bottom <= top:
+        print(f"{prefix} 잘못된 탐지 박스 {bbox}")
         return None
+    detected_labels = ", ".join(
+        f"{obj['class_name']} ({obj['confidence']:.1%})"
+        for obj in objects
+    )
+    print(f"{prefix} 검출 클래스={detected_labels or '없음'}")
+    candidates = [obj for obj in objects if _label(obj) in RAMP_LABELS]
+    print(f"{prefix} 탐지 박스={bbox} | 전체 검출={len(objects)} | 경사로 후보={len(candidates)}")
 
     best, best_overlap = None, 0
-    for obj in objects:
+    for index, obj in enumerate(candidates, 1):
         mask = obj.get("mask")
-        if _label(obj) not in RAMP_LABELS:
-            continue
+        confidence = obj["confidence"]
         if mask is None or mask.shape != (height, width):
+            shape = None if mask is None else mask.shape
+            print(f"{prefix} 후보 {index} | 신뢰도={confidence:.1%} | 마스크 없음 또는 크기 불일치 {shape}")
             continue
+
+        area = np.count_nonzero(mask)
         overlap = np.count_nonzero(mask[top:bottom, left:right])
-        if overlap >= max(60, 0.5 * np.count_nonzero(mask)) and overlap > best_overlap:
+        required = max(60, 0.5 * area)
+        ratio = overlap / area if area else 0.0
+        passes = overlap >= required
+        print(
+            f"{prefix} 후보 {index} | 신뢰도={confidence:.1%} | "
+            f"박스 안 마스크={overlap}/{area}픽셀 ({ratio:.1%}) | "
+            f"필요={required:g}픽셀 | {'통과' if passes else '겹침 부족'}"
+        )
+        if passes and overlap > best_overlap:
             best, best_overlap = obj, overlap
+
+    if best is None:
+        print(f"{prefix} 최종 매칭 없음")
+    else:
+        print(f"{prefix} 선택 마스크 박스={best['bbox']} | 겹침={best_overlap}픽셀")
     return best
 
 
@@ -235,11 +286,18 @@ def _ramp_mask_in_box(image, bbox, model):
         return None
 
     pad_x, pad_y = ceil(width * 0.15), ceil(height * 0.15)
+
     x0, y0 = max(0, left - pad_x), max(0, top - pad_y)
     x1, y1 = min(image.width, right + pad_x), min(image.height, bottom + pad_y)
     crop = image.crop((x0, y0, x1, y1))
     objects, _ = detect_ramp_with_image(crop, model=model)
-    match = _matching_ramp(objects, crop.size, (left - x0, top - y0, right - x0, bottom - y0))
+    # match = _matching_ramp(objects, crop.size, (left - x0, top - y0, right - x0, bottom - y0))
+    match = _matching_ramp(
+        objects,
+        crop.size,
+        (left - x0, top - y0, right - x0, bottom - y0),
+        stage="잘라낸 영역",
+    )    
     if match is None:
         return None
 
@@ -251,18 +309,52 @@ def _ramp_mask_in_box(image, bbox, model):
 def _merge_ramp_masks(objects, image_size):
     width, height = image_size
 
-    ramps = [
-        obj for obj in objects
-        if _label(obj) in RAMP_LABELS
-        and obj.get("mask") is not None
-        and obj["mask"].shape == (height, width)
-        and obj["mask"].any()
-    ]
+# def _segment_ramp(image, bbox, model, full_frame_results):
+#     # match = _matching_ramp(full_frame_results, image.size, bbox)
+#     match = _matching_ramp(full_frame_results, image.size, bbox, stage="원본")
+#     if match is not None:
+#         return match["mask"], match["bbox"]
+#     return _ramp_mask_in_box(image, bbox, model)
 
-    if not ramps:
-        return []
 
-    merged = np.zeros((height, width), dtype=np.uint8)
+def _segment_ramp(image, bbox, model, full_frame_results):
+    match = _matching_ramp(
+        full_frame_results, image.size, bbox, stage="원본"
+    )
+    if match is not None:
+        return match["mask"], match["bbox"]
+
+    cropped_match = _ramp_mask_in_box(image, bbox, model)
+    if cropped_match is not None:
+        return cropped_match
+
+    retry_conf = 0.10
+    if not isinstance(model, RampSegmentation) or model.confidence <= retry_conf:
+        return None
+
+    print(f"[경사면 재시도] 신뢰도 기준 {model.confidence:.0%} → {retry_conf:.0%}")
+    retry_model = RampSegmentation(model.model, retry_conf)
+    retry_results, _ = detect_ramp_with_image(image, model=retry_model)
+
+    match = _matching_ramp(
+        retry_results, image.size, bbox, stage="원본 · 10% 재시도"
+    )
+    if match is not None:
+        return match["mask"], match["bbox"]
+
+    return _ramp_mask_in_box(image, bbox, retry_model)
+
+
+def _ground_detections(image, model):
+    objects, _ = detect_ramp_with_image(image, model=model)
+    return [obj for obj in objects if _label(obj) in GROUND_LABELS]
+
+
+def _detect_then_segment(image, detector, ramp_model, ground_model, *, draw_masks=True):
+    if getattr(detector, "task", None) != "detect":
+        raise ValueError("첫 번째 경로에 경사로·계단 Detection 모델을 입력해 주세요.")
+    if any(getattr(model, "task", None) != "segment" for model in (ramp_model, ground_model)):
+        raise ValueError("경사로 분할과 기준 바닥에는 각각 Segmentation 모델을 입력해 주세요.")
 
     for ramp in ramps:
         merged[ramp["mask"]] = 255
@@ -294,136 +386,26 @@ def _merge_ramp_masks(objects, image_size):
 
         if not contributors:
             continue
-
-        ys, xs = np.where(mask)
-
-        results.append({
-            "class_name": "ramp",
-            "confidence": max(
-                ramp["confidence"]
-                for ramp in contributors
-            ),
-            "bbox": [
-                int(xs.min()),
-                int(ys.min()),
-                int(xs.max()) + 1,
-                int(ys.max()) + 1
-            ],
-            "mask": mask,
-            "merged_count": len(contributors),
-            "source": "segmentation"
-        })
-
-    return results
-
-def _detect_then_segment(image, detector, ramp_model, ground_model):
-    if getattr(detector, "task", None) != "detect":
-        raise ValueError("Detection model required.")
-
-    if any(
-        getattr(model, "task", None) != "segment"
-        for model in (ramp_model, ground_model)
-    ):
-        raise ValueError("Segmentation models required.")
-
-    # 1. Detection
-    detection_results, _ = detect_ramp_with_image(
-        image,
-        model=detector,
-        conf=0.15
-    )
-
-    # 2. Independent segmentation
-    segment_results, _ = detect_ramp_with_image(
-        image,
-        model=ramp_model,
-        conf=0.25
-    )
-
-    obstacles = [
-        obj for obj in detection_results
-        if _label(obj) in OBSTACLE_LABELS
-    ]
-
-    detected_ramps = [
-        obj for obj in detection_results
-        if _label(obj) in RAMP_LABELS
-    ]
-
-    # 3. Merge fragmented ramp masks
-    segmented_ramps = _merge_ramp_masks(
-        segment_results,
-        image.size
-    )
-
-    final_ramps = list(segmented_ramps)
-
-    # 4. Combine detection and segmentation
-    for ramp in detected_ramps:
-        ramp["source"] = "detection"
-
-        match = _matching_ramp(
-            segmented_ramps,
-            image.size,
-            ramp["bbox"]
-        )
-
-        if match is not None:
-            match["source"] = "detection+segmentation"
-            continue
-
-        # Retry segmentation around the detection box.
-        cropped = _ramp_mask_in_box(
-            image,
-            ramp["bbox"],
-            ramp_model
-        )
-
-        if cropped is not None:
-            ramp["mask"], ramp["angle_bbox"] = cropped
-            ramp["source"] = "detection+crop"
+        if full_frame_results is None:
+            full_frame_results, _ = detect_ramp_with_image(image, model=ramp_model)
+        matched = _segment_ramp(image, ramp["bbox"], ramp_model, full_frame_results)
+        if matched is None:
+            ramp["mask_error"] = "원본과 탐지 박스 주변에서 경사면 마스크를 얻지 못했습니다."
         else:
-            ramp["mask_error"] = (
-                "경사로 후보의 마스크를 확보하지 못했습니다."
-            )
-
-        final_ramps.append(ramp)
-
-    # 5. Remove duplicate ramps
-    final_ramps = _deduplicate_ramps(final_ramps)
-
-    # 6. Record conflicts without stopping segmentation
-    for ramp in final_ramps:
-        ramp["obstacle_conflict"] = any(
-            _boxes_conflict(
-                ramp["bbox"],
-                obstacle["bbox"]
-            )
-            for obstacle in obstacles
-        )
-
-    # 7. Ground segmentation
-    grounds = []
-
-    if any("mask" in ramp for ramp in final_ramps):
-        ground_results, _ = detect_ramp_with_image(
-            image,
-            model=ground_model
-        )
+            ramp["mask"], ramp["angle_bbox"] = matched
 
         grounds = [
             obj for obj in ground_results
             if _label(obj) in GROUND_LABELS
         ]
-
-    # 8. Generate preview
-    detections = obstacles + final_ramps + grounds
-
-    preview = image.copy()
-
-    _draw_masks(preview, grounds + final_ramps)
-    _draw_boxes(preview, obstacles + final_ramps)
-
+        preview = image.copy()
+    if any("mask" in ramp for ramp in filtered_ramps):
+        grounds = _ground_detections(image, ground_model)
+        detections.extend(grounds)
+        if draw_masks:
+            _draw_masks(preview, grounds + filtered_ramps)
+    if duplicates_removed:
+        _draw_boxes(preview, [obj for obj in detections if _label(obj) not in GROUND_LABELS])
     return detections, preview
 
 
@@ -443,20 +425,26 @@ def _draw_obstacle_relations(preview, details):
 
 def analyze_image(
     image, model, fov=60.0, slope_limit=None, *, ground_model=None, ramp_segment_model=None,
-    spread_samples=False,
+    spread_samples=False, fallback_ramp_segment_model=None,
 ):
     image = ImageOps.exif_transpose(image).convert("RGB")
     image.thumbnail((1024, 1024))
     retried = False
     hybrid = ramp_segment_model is not None
+    fallback = fallback_ramp_segment_model
+    if fallback is not None and (not hybrid or getattr(fallback, "task", None) != "segment"):
+        raise ValueError("보조 경사로 분할에는 기본 경사로 분할 모델과 Segmentation 가중치가 필요합니다.")
     if hybrid:
-        detections, preview = _detect_then_segment(image, model, ramp_segment_model, ground_model)
+        detections, preview = _detect_then_segment(
+            image, model, ramp_segment_model, ground_model, draw_masks=fallback is None,
+        )
     elif ground_model is None:
         detections, preview = detect_ramp_with_image(image, model=model)
     else:
         detections, preview, retried = _dual_segmentation(image, model, ground_model)
     ramps = [obj for obj in detections if _label(obj) in RAMP_LABELS]
-    measurements = []
+    obstacle_detected = any(_label(obj) in OBSTACLE_LABELS for obj in detections)
+    outcomes = {}
     segmented = hybrid or getattr(model, "task", None) == "segment"
     ground_masks = [
         obj["mask"] for obj in detections if _label(obj) in GROUND_LABELS and "mask" in obj
@@ -464,39 +452,98 @@ def analyze_image(
     foreground = [
         obj for obj in detections if _label(obj) not in GROUND_LABELS and "mask" in obj
     ]
-    if ramps:
-        depth = None
-        draw = ImageDraw.Draw(preview)
+    depth = None
+
+    def measure(candidate, original):
+        nonlocal depth
+        if hybrid:
+            if "mask_error" in candidate:
+                raise AngleUnavailable(candidate["mask_error"])
+            if not ground_masks:
+                raise AngleUnavailable("원본 사진에서 기준 바닥 마스크를 얻지 못했습니다.")
+        if depth is None:
+            depth = estimate_depth(image)
+            if depth.shape != (image.height, image.width):
+                raise ValueError("깊이 결과의 크기가 분석 사진과 일치하지 않습니다.")
+        if segmented:
+            excluded_masks = [
+                obj["mask"] for obj in foreground
+                if obj is not original and (
+                    candidate is original or _label(obj) not in RAMP_LABELS or not _same_ramp(candidate, obj)
+                )
+            ]
+            return estimate_segmented_angle(
+                depth, candidate.get("mask"), ground_masks, excluded_masks, fov,
+                image=image, bbox=candidate.get("angle_bbox", candidate["bbox"]),
+                spread_samples=spread_samples,
+            )
+        other_boxes = [obj["bbox"] for obj in detections if obj is not original]
+        return estimate_ramp_angle(depth, candidate["bbox"], other_boxes, fov, image=image)
+
+    for ramp in ramps:
+        try:
+            outcomes[id(ramp)] = (measure(ramp, ramp), None, "primary")
+        except AngleUnavailable as error:
+            outcomes[id(ramp)] = (None, str(error), None)
+
+    if fallback is not None:
+        ground_checked = any("mask" in ramp for ramp in ramps)
+        fallback_results = None
+        obstacles = [obj for obj in detections if _label(obj) in OBSTACLE_LABELS]
         for ramp in ramps:
-            try:
-                if hybrid:
-                    if "mask_error" in ramp:
-                        raise AngleUnavailable(ramp["mask_error"])
-                    if not ground_masks:
-                        raise AngleUnavailable("원본 사진에서 기준 바닥 마스크를 얻지 못했습니다.")
-                if depth is None:
-                    depth = estimate_depth(image)
-                    if depth.shape != (image.height, image.width):
-                        raise ValueError("깊이 결과의 크기가 분석 사진과 일치하지 않습니다.")
-                if segmented:
-                    excluded_masks = [obj["mask"] for obj in foreground if obj is not ramp]
-                    angle, ramp_points, ground_points = estimate_segmented_angle(
-                        depth, ramp.get("mask"), ground_masks, excluded_masks, fov,
-                        image=image, bbox=ramp.get("angle_bbox", ramp["bbox"]),
-                        spread_samples=spread_samples,
-                    )
-                else:
-                    other_boxes = [obj["bbox"] for obj in detections if obj is not ramp]
-                    angle, ramp_points, ground_points = estimate_ramp_angle(
-                        depth, ramp["bbox"], other_boxes, fov, image=image
-                    )
-            except AngleUnavailable as error:
-                measurements.append({"angle": None, "reason": str(error)})
+            result, reason, _ = outcomes[id(ramp)]
+            if result is not None or any(_boxes_conflict(ramp["bbox"], obj["bbox"]) for obj in obstacles):
                 continue
-            measurements.append({"angle": angle, "reason": None})
-            for pixels, color in ((ramp_points, "cyan"), (ground_points, "orange")):
-                for x, y in pixels.tolist():
-                    draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color)
+            if ground_checked and not ground_masks:
+                break
+            if fallback_results is None:
+                fallback_results, _ = detect_ramp_with_image(image, model=fallback)
+            matched = _segment_ramp(image, ramp["bbox"], fallback, fallback_results)
+            if matched is None:
+                outcomes[id(ramp)] = (None, f"기본 · {reason} / 보조 · 경사면 마스크를 얻지 못했습니다.", None)
+                continue
+            mask, angle_bbox = matched
+            candidate = {**ramp, "mask": mask, "angle_bbox": angle_bbox}
+            candidate.pop("mask_error", None)
+            if not ground_checked:
+                ground_checked = True
+                grounds = _ground_detections(image, ground_model)
+                detections.extend(grounds)
+                ground_masks.extend(obj["mask"] for obj in grounds if "mask" in obj)
+            try:
+                result = measure(candidate, ramp)
+            except AngleUnavailable as error:
+                outcomes[id(ramp)] = (None, f"기본 · {reason} / 보조 · {error}", None)
+                continue
+            ramp.pop("mask_error", None)
+            ramp.update(candidate)
+            if not any(obj is ramp for obj in foreground):
+                foreground.append(ramp)
+            outcomes[id(ramp)] = (result, None, "fallback")
+
+        measured_ids = {key for key, (result, _, _) in outcomes.items() if result is not None}
+        ramps = _deduplicate_ramps(ramps, measured_ids)
+        kept_ids = {id(ramp) for ramp in ramps}
+        detections = [obj for obj in detections if _label(obj) not in RAMP_LABELS or id(obj) in kept_ids]
+        preview = image.copy()
+        _draw_masks(preview, [obj for obj in detections if _label(obj) in GROUND_LABELS] + ramps)
+        _draw_boxes(preview, [obj for obj in detections if _label(obj) not in GROUND_LABELS])
+
+    measurements = []
+    draw = ImageDraw.Draw(preview)
+    for ramp in ramps:
+        result, reason, source = outcomes[id(ramp)]
+        if result is None:
+            measurements.append({"angle": None, "reason": reason})
+            continue
+        angle, ramp_points, ground_points = result
+        measurement = {"angle": angle, "reason": None}
+        if fallback is not None:
+            measurement["ramp_model"] = source
+        measurements.append(measurement)
+        for pixels, color in ((ramp_points, "cyan"), (ground_points, "orange")):
+            for x, y in pixels.tolist():
+                draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color)
 
     # 통행 조건 판단 모듈 호출
     model_classes = check_model_classes(model)

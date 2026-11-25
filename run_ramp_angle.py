@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--detector", default="runs/detect/ramp_final/weights/best.pt")
     parser.add_argument("--ground", default="runs/segment/ramp_seg/weights/best.pt")
     parser.add_argument("--ramp", default="runs/segment/ramp_mask_e20/weights/best.pt")
+    parser.add_argument("--fallback-ramp", help="Ramp segmentation weights to try after the primary model fails")
     parser.add_argument("--ramp-conf", type=float, default=0.20)
     parser.add_argument("--fov", type=float, default=60.0)
     parser.add_argument("--spread-samples", action="store_true", help="Use a wider sample strip at the ramp entrance")
@@ -26,15 +27,21 @@ def main():
         parser.error("--fov must be between 0 and 180 degrees")
 
     print(f"Ramp segmentation: {args.ramp} | threshold: {args.ramp_conf:.0%}", flush=True)
+    if args.fallback_ramp:
+        print(f"보조 경사면 분할 모델 · {args.fallback_ramp}", flush=True)
     if args.spread_samples:
         print("입구 경계 추정 시 표본 범위 확장", flush=True)
     with Image.open(args.photo) as image:
         detector = load_model(resolve_weights(args.detector))
         ground_model = load_model(resolve_weights(args.ground))
         ramp_model = RampSegmentation(load_model(resolve_weights(args.ramp)), args.ramp_conf)
+        fallback_model = None
+        if args.fallback_ramp:
+            fallback_model = RampSegmentation(load_model(resolve_weights(args.fallback_ramp)), args.ramp_conf)
         result = analyze_image(
             image, detector, args.fov, ground_model=ground_model, ramp_segment_model=ramp_model,
             spread_samples=args.spread_samples,
+            fallback_ramp_segment_model=fallback_model,
         )
 
     for index, measurement in enumerate(result["ramps"], 1):
@@ -42,7 +49,10 @@ def main():
         if angle is None:
             print(f"경사로 {index} 추정 불가 · {measurement['reason']}")
         else:
-            print(f"경사로 {index} 추정 경사각 · {angle:.2f}°")
+            source = measurement.get("ramp_model")
+            weights = {"primary": args.ramp, "fallback": args.fallback_ramp}.get(source)
+            detail = f" · 사용한 경사면 모델 {weights}" if weights else ""
+            print(f"경사로 {index} 추정 경사각 · {angle:.2f}°{detail}")
     if not result["ramps"]:
         print(result["reason"])
     if args.preview is not None:
